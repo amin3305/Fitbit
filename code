@@ -1,0 +1,573 @@
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_i2c.h"
+#include "lpc17xx_ssp.h"
+#include "lpc17xx_timer.h"
+#include "lpc17xx_uart.h"
+
+#include "joystick.h"
+#include "pca9532.h"
+#include "acc.h"
+#include "oled.h"
+#include "rgb.h"
+
+#include "stdio.h"
+#include "LPC17xx.h"
+#include "light.h"
+#include "temp.h"
+#include "led7seg.h"
+#include "uart2.h"
+
+#include <string.h>
+#include "font5x7.h"
+
+#include <math.h>
+
+volatile uint32_t msTicks;
+volatile uint32_t halfsecTicks;
+volatile uint32_t onesecTicks;
+volatile uint32_t fivesecticks;
+volatile double timetaken=0;
+uint32_t sw3 = 1;
+uint32_t sw4 = 1;
+static int TEMP_THRESHOLD = 31;
+static float ACC_THRESHOLD = 0.10;
+int joycontrol;
+int8_t OLED_LIGHT[15];
+int8_t OLED_TEMPERATURE[15];
+int8_t OLED_ACCELERATION[15];
+int8_t OLED_TIMETAKEN[15];
+int8_t oledthres[15];
+
+unsigned char result[100] = "";
+
+
+void SysTick_Handler(void){
+	 msTicks++;
+}
+
+__INLINE static void systick_delay (uint32_t delayTicks) {
+  uint32_t currentTicks;
+
+  currentTicks = msTicks;	// read current tick counter
+  // Now loop until required number of ticks passes
+  while ((msTicks - currentTicks) < delayTicks);
+}
+
+uint32_t getTicks() {
+	return msTicks;
+}
+
+static void init_ssp(void)
+{
+	SSP_CFG_Type SSP_ConfigStruct;
+	PINSEL_CFG_Type PinCfg;
+
+	/*
+	 * Initialize SPI pin connect
+	 * P0.7 - SCK;
+	 * P0.8 - MISO
+	 * P0.9 - MOSI
+	 * P2.2 - SSEL - used as GPIO
+	 */
+	PinCfg.Funcnum = 2;
+	PinCfg.OpenDrain = 0;
+	PinCfg.Pinmode = 0;
+	PinCfg.Portnum = 0;
+	PinCfg.Pinnum = 7;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 8;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 9;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Funcnum = 0;
+	PinCfg.Portnum = 2;
+	PinCfg.Pinnum = 2;
+	PINSEL_ConfigPin(&PinCfg);
+
+	SSP_ConfigStructInit(&SSP_ConfigStruct);
+
+	// Initialize SSP peripheral with parameter given in structure above
+	SSP_Init(LPC_SSP1, &SSP_ConfigStruct);
+
+	// Enable SSP peripheral
+	SSP_Cmd(LPC_SSP1, ENABLE);
+
+}
+
+static void init_i2c(void)
+{
+	PINSEL_CFG_Type PinCfg;
+
+	/* Initialize I2C2 pin connect */
+	PinCfg.Funcnum = 2;
+	PinCfg.Pinnum = 10;
+	PinCfg.Portnum = 0;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 11;
+	PINSEL_ConfigPin(&PinCfg);
+
+	// Initialize I2C peripheral
+	I2C_Init(LPC_I2C2, 100000);
+
+	/* Enable I2C1 operation */
+	I2C_Cmd(LPC_I2C2, ENABLE);
+}
+
+typedef enum {
+	initialization, initializing, climb, rest, emergency, over
+}mode;
+volatile mode modes;
+
+void blue_init(void)
+{
+	PINSEL_CFG_Type PinCfg;
+
+	/* Set P0_22 to 00 - GPIO */
+	PinCfg.Funcnum = 0;
+	PinCfg.Pinnum = 26;
+	PinCfg.Portnum = 0;
+	PINSEL_ConfigPin(&PinCfg);
+
+	// Set GPIO - P0_22 - to be output
+	GPIO_SetDir(0,(1<<26),1);
+}
+
+void red_init(void)
+{
+	PINSEL_CFG_Type PinCfg;
+
+	/* Set P0_22 to 00 - GPIO */
+	PinCfg.Funcnum = 0;
+	PinCfg.Pinnum = 0;
+	PinCfg.Portnum = 2;
+	PINSEL_ConfigPin(&PinCfg);
+
+	// Set GPIO - P0_22 - to be output
+	GPIO_SetDir(2,(1<<0),1);
+}
+
+
+void blue_on (void)
+{
+	GPIO_SetValue(0,(1<<26));
+}
+
+// Function to turn LED2 off
+void blue_off (void)
+{
+	GPIO_ClearValue(0,(1<<26));
+}
+
+void red_on (void)
+{
+	GPIO_SetValue(2,(1<<0));
+}
+
+void red_off (void)
+{
+	GPIO_ClearValue(2,(1<<0));
+}
+
+// Function to invert current state of LED2
+void blue_invert (void)
+{
+	int ledstate;
+
+	// Read current state of GPIO P0_0..31, which includes LED2
+	ledstate = GPIO_ReadValue(0);
+
+	// Turn off LED2 if it is on
+	// (ANDing to ensure we only affect the LED output)
+	GPIO_ClearValue(0,(ledstate & (1 << 26)));
+	// Turn on LED2 if it is off
+	// (ANDing to ensure we only affect the LED output)
+	GPIO_SetValue(0,((~ledstate) & (1 << 26)));
+}
+
+void red_invert (void)
+{
+	int ledstate;
+
+	ledstate = GPIO_ReadValue(2);
+
+	GPIO_ClearValue(2,(ledstate & (1 << 0)));
+	GPIO_SetValue(2,((~ledstate) & (1 << 0)));
+}
+
+static void OLED_printStr(unsigned char* result) {
+	oled_clearScreen(OLED_COLOR_BLACK);
+	oled_putString(0, 0, result, OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+}
+
+
+
+static void init_GPIO(void) {
+
+	//Initialize button sw4
+	PINSEL_CFG_Type PinCfg;
+	PinCfg.Funcnum = 0;
+	PinCfg.OpenDrain = 0;
+	PinCfg.Pinmode = 0;
+	PinCfg.Portnum = 1;
+	PinCfg.Pinnum = 31;
+	PINSEL_ConfigPin(&PinCfg);
+	GPIO_SetDir(1, 1 << 31, 0);
+
+	//Initialize button sw3
+	PinCfg.Funcnum = 0;
+	PinCfg.OpenDrain = 0;
+	PinCfg.Pinmode = 0;
+	PinCfg.Portnum = 2;
+	PinCfg.Pinnum = 10;
+	PINSEL_ConfigPin(&PinCfg);
+	GPIO_SetDir(2, 1 << 10, 0);
+
+}
+
+void EINT3_IRQHandler(void)
+{
+    if((LPC_GPIOINT->IO2IntStatF>>10)& 0x1){
+    	if(modes == initialization){
+    		modes = initializing;
+    	}
+
+    	LPC_GPIOINT->IO2IntClr |= 1<<10;
+    }
+
+    return;
+}
+
+void ledarrayclr(void)
+{
+	uint32_t LED = 0x0001;
+	pca9532_setLeds(0x0000,LED);
+	pca9532_setLeds(0x0000,LED*2);
+	pca9532_setLeds(0x0000,LED*4);
+	pca9532_setLeds(0x0000,LED*8);
+	pca9532_setLeds(0x0000,LED*16);
+	pca9532_setLeds(0x0000,LED*32);
+	pca9532_setLeds(0x0000,LED*64);
+	pca9532_setLeds(0x0000,LED*128);
+	pca9532_setLeds(0x0000,LED*256);
+	pca9532_setLeds(0x0000,LED*512);
+	pca9532_setLeds(0x0000,LED*1024);
+	pca9532_setLeds(0x0000,LED*2048);
+	pca9532_setLeds(0x0000,LED*4096);
+	pca9532_setLeds(0x0000,LED*8192);
+	pca9532_setLeds(0x0000,LED*16384);
+	pca9532_setLeds(0x0000,LED*32768);
+}
+
+void ledarraylightup(int lednumber)
+{
+	uint32_t led;
+	int multiply = 1;
+	int counter=1;
+	ledarrayclr();
+	if(lednumber != 0){
+		pca9532_setLeds(0x0001,0x0000); //set 1st led
+		for(counter=1;counter<lednumber;counter++){
+			led = 0x0001;
+			multiply *= 2;
+			led *= multiply;
+			pca9532_setLeds(led,0x0000);
+		}
+	}
+
+}
+
+int ledarraynumber(uint32_t luminous)
+{
+	int lednumber=luminous/200;
+	if(luminous <= 20){
+		oled_putString(0,40,(uint8_t *)"DIM",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+		return 16;
+	}
+	else if(luminous >= 3000){
+		oled_putString(0,40,(uint8_t *)"   ",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+		return 0;
+	}
+	else{
+		oled_putString(0,40,(uint8_t *)"DIM",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+		switch(lednumber){
+		case 0:return 15; break;
+		case 1:return 14; break;
+		case 2:return 13; break;
+		case 3:return 12; break;
+		case 4:return 11; break;
+		case 5:return 10; break;
+		case 6:return 9; break;
+		case 7:return 8; break;
+		case 8:return 7; break;
+		case 9:return 6; break;
+		case 10:return 5; break;
+		case 11:return 4; break;
+		case 12:return 3; break;
+		case 13:return 2; break;
+		case 14:return 1; break;
+		}
+	}
+}
+
+void bluered_alt (void)
+{
+	int ledstateb,ledstater,ledsetb;
+	ledstateb = (GPIO_ReadValue(0) >> 26) & 0x01;
+	ledstater = GPIO_ReadValue(2) & 0x01;
+
+	if((ledstateb | ledstater) == 0){
+		GPIO_SetValue(0,(1 << 26));
+	}
+	else if((ledstater | ledstateb) == 1){
+		ledsetb = (ledstateb << 26);
+		GPIO_SetValue(0,((~ledsetb) & (1 << 26)));
+		GPIO_ClearValue(0,((ledsetb) & (1 << 26)));
+		GPIO_SetValue(2,((~ledstater) & (1 << 0)));
+		GPIO_ClearValue(2,((ledstater) & (1 << 0)));
+	}
+}
+
+void pinsel_uart3(void){
+	PINSEL_CFG_Type PinCfg;
+	PinCfg.Funcnum = 2;
+	PinCfg.Pinnum = 0;
+	PinCfg.Portnum = 0;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 1;
+	PINSEL_ConfigPin(&PinCfg);
+}
+
+void pinsel_xbee(void){
+	PINSEL_CFG_Type PinCfg;
+	PinCfg.Funcnum = 1;
+	PinCfg.Pinnum = 0;
+	PinCfg.Portnum = 2;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 17;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 17;
+	PINSEL_ConfigPin(&PinCfg);
+}
+void init_uart(){
+	UART_CFG_Type uartCfg;
+	uartCfg.Baud_rate = 115200;
+	uartCfg.Databits = UART_DATABIT_8;
+	uartCfg.Parity = UART_PARITY_NONE;
+	uartCfg.Stopbits = UART_STOPBIT_1;
+	pinsel_uart3();
+	UART_Init(LPC_UART3, &uartCfg);
+	UART_TxCmd(LPC_UART3, ENABLE);
+}
+
+void joystick (void)
+{
+	uint8_t joyread;
+	joyread = joystick_read();
+	if(joyread == 1){
+		joycontrol = 1;
+	}
+	if(joycontrol == 1){
+		switch(joyread){
+		case 3:ACC_THRESHOLD+=0.1;joycontrol = 0;break; //up
+		case 5:ACC_THRESHOLD-=0.1;joycontrol = 0;break;//down
+		case 9:TEMP_THRESHOLD-=1;joycontrol = 0;break;//left
+		case 17:TEMP_THRESHOLD+=1;joycontrol = 0;break;//right
+		}
+	}
+}
+
+int main(void)
+{
+	rgb_init ();blue_init();red_init();init_i2c();
+	init_ssp();init_GPIO();init_uart();pca9532_init();
+	joystick_init();acc_init();oled_init();led7seg_init();
+	temp_init(getTicks);light_enable();
+	light_setRange(LIGHT_RANGE_4000);
+	uint8_t x[10] = {0x30,0x20,0x7C,0x22,0x32,0x39,0x70,0xE0,0x7D,0x24};
+	uint8_t saved[5] = {0x32,0x28,0x25,0xA2,0x61};
+	int countonesec = 0;int v = 0;int y = 0;int w = 0;int z = 0;
+	uint8_t acx = 0;uint8_t acy = 0;uint8_t acz = 0;uint8_t ax = 0;
+	uint8_t ay = 0;uint8_t az = 0;uint8_t anx = 0;uint8_t any = 0;
+	uint8_t anz = 0;uint32_t lux = 0;
+	float netacc = 0;float temperature = 0;
+	sw3 = (GPIO_ReadValue(2) >> 10) & 0x01;
+	sw4 = (GPIO_ReadValue(1) >> 31) & 0x01;
+	modes = initialization;
+	LPC_GPIOINT->IO2IntEnF |= 1<<10;
+	NVIC_EnableIRQ(EINT3_IRQn);
+	oled_clearScreen(OLED_COLOR_BLACK);
+	if (SysTick_Config(SystemCoreClock / 1000)){
+		while(1);
+	}
+	char climbmsg[20] = "CLIMB mode \r\n";
+	char emergencymsg[20] = "EMERGENCY! \r\n";
+	uint8_t climbdatauart[28];
+	uint8_t emergencydatauart[35];
+	uint8_t overdatauart[70];
+	while(1){
+		switch(modes){
+		case initialization:
+			led7seg_setChar(0xFF,TRUE);
+			joystick();
+			oled_putString(0,0,(uint8_t *)"INITIALIZATION",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,10,(uint8_t *)"Mode.",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,20,(uint8_t *)"Press TOGGLE",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,30,(uint8_t *)"to climb.",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			sprintf(oledthres,"THRES:%dC,%.2fg",TEMP_THRESHOLD,ACC_THRESHOLD);
+			oled_putString(0,50,(uint8_t *)oledthres,OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			break;
+
+		case initializing:
+			oled_clearScreen(OLED_COLOR_BLACK);
+			oled_putString(0,0,(uint8_t *)"INITIALIZATION",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,10,(uint8_t *)"COMPLETE.",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,20,(uint8_t *)"ENTERING",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,30,(uint8_t *)"CLIMB MODE.",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			while(y<10){
+				if(msTicks - onesecTicks >= 1000){
+					onesecTicks = msTicks;
+					blue_invert();
+				}
+				if(msTicks - halfsecTicks >= 500){
+					halfsecTicks = msTicks;
+					led7seg_setChar(x[y],TRUE);
+					y++;
+				}
+			}
+			oled_clearScreen(OLED_COLOR_BLACK);
+			UART_Send(LPC_UART3,(uint8_t *)climbmsg,strlen(climbmsg), BLOCKING);
+			led7seg_setChar(0xFF,TRUE);
+			blue_off();
+			red_off();
+			acc_read(&acx, &acy, &acz);
+			modes = climb;
+			break;
+
+		case climb:
+			joystick();
+			temperature = temp_read();
+			lux = light_read();
+			ledarraylightup(ledarraynumber(light_read()));
+			acc_read(&ax, &ay, &az);
+			anx = pow((ax - acx),2);
+			any = pow((ay - acy),2);
+			anz = pow((az - acz),2);
+			netacc = (sqrt(anx+any+anz))/(64);
+
+			sprintf(OLED_LIGHT, "LIGHT=%d lux", lux);
+			sprintf(OLED_TEMPERATURE, "TEMP=%.1f deg", temperature/10);
+			sprintf(OLED_ACCELERATION, "NET ACC=%.2fg", netacc);
+			sprintf(oledthres,"THRES:%dC,%.2fg",TEMP_THRESHOLD,ACC_THRESHOLD);
+			oled_putString(0,50,(uint8_t *)oledthres,OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0, 0, (uint8_t *) "CLIMB", OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0, 10, (uint8_t *) OLED_LIGHT, OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0, 20, (uint8_t *) OLED_TEMPERATURE,OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+			oled_putString(0, 30, (uint8_t *) OLED_ACCELERATION, OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			if((msTicks - fivesecticks) >= 5000){
+				fivesecticks = msTicks;
+				sprintf(climbdatauart,"%d lux, %.1f deg, %.2fg \r\n",lux,(temperature/10),netacc);
+				UART_Send(LPC_UART3,&climbdatauart,28, BLOCKING);
+			}
+			if(netacc > ACC_THRESHOLD){
+				oled_clearScreen(OLED_COLOR_BLACK);
+				onesecTicks = 0;
+				halfsecTicks = 0;
+				fivesecticks = 0;
+				ledarrayclr();
+				UART_Send(LPC_UART3,(uint8_t *)emergencymsg,strlen(emergencymsg), BLOCKING);
+				modes = emergency;
+			}
+			if((temperature/10) < TEMP_THRESHOLD){
+				w = 0;
+			}
+			if((temperature/10) > TEMP_THRESHOLD && (w==0)){
+				oled_clearScreen(OLED_COLOR_BLACK);
+				modes = rest;
+			}
+			break;
+
+		case rest:
+			while(z < 3){
+				if(msTicks - onesecTicks >= 1000){
+					onesecTicks = msTicks;
+					oled_putString(0,0,(uint8_t *)"REST NOW",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+					z++;
+				}
+			}
+			if(z==3){
+				oled_clearScreen(OLED_COLOR_BLACK);
+				z = 0;
+				w = 1;
+				modes = climb;
+			}
+
+			break;
+
+		case emergency:
+			oled_putString(0,0,(uint8_t *)"EMERGENCY",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,10,(uint8_t *)"Mode!",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			oled_putString(0,40,(uint8_t *)"TIME ELASPED=",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			while(modes == emergency){
+				if(msTicks - halfsecTicks >= 500){
+					halfsecTicks = msTicks;
+					bluered_alt();
+					countonesec++;
+				}
+				temperature = temp_read();
+				acc_read(&ax, &ay, &az);//current acc
+				anx = pow((ax - acx),2);
+				any = pow((ay - acy),2);
+				anz = pow((az - acz),2);
+				netacc = (sqrt(anx+any+anz))/(64);
+				sprintf(OLED_TEMPERATURE, "TEMP=%.1f ", temperature/10);
+				sprintf(OLED_ACCELERATION, "NET ACC=%.2fg", netacc);
+				sprintf(OLED_TIMETAKEN, "%ds", (countonesec/2));
+				oled_putString(0, 20, (uint8_t *) OLED_TEMPERATURE,OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+				oled_putString(0, 30, (uint8_t *) OLED_ACCELERATION, OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+				oled_putString(0, 50, (uint8_t *) OLED_TIMETAKEN, OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+				if((countonesec%10) == 0){
+					sprintf(emergencydatauart,"%.1f deg, %.2fg, time elapsed:%d \r\n",(temperature/10),netacc,(countonesec/2));
+					UART_Send(LPC_UART3,&emergencydatauart,35, BLOCKING);
+				}
+				sw3 = (GPIO_ReadValue(2) >> 10) & 0x01;
+				sw4 = (GPIO_ReadValue(1) >> 31) & 0x01;
+				if((sw3 || sw4) == 0){
+					modes = over;
+				}
+			}
+			oled_clearScreen(OLED_COLOR_BLACK);
+			red_off();
+			sprintf(overdatauart,"Emergency is cleared! Time consumed for recovery: %d sec \r\n",(countonesec/2));
+			UART_Send(LPC_UART3,&overdatauart,strlen(overdatauart), BLOCKING);
+			break;
+
+		case over:
+			oled_putString(0,0,(uint8_t *)"SAVED",OLED_COLOR_WHITE,OLED_COLOR_BLACK);
+			while(v < 5){
+				if(msTicks - onesecTicks >= 1000){
+					onesecTicks = msTicks;
+					blue_invert();
+					led7seg_setChar(saved[v],TRUE);
+					v++;
+				}
+			}
+			systick_delay (1000);
+			led7seg_setChar(0xFF,TRUE);
+			blue_off();
+			red_off();
+			v = 0;
+			countonesec = 0;
+			oled_clearScreen(OLED_COLOR_BLACK);
+			UART_Send(LPC_UART3,(uint8_t *)climbmsg,strlen(climbmsg), BLOCKING);
+			acc_read(&acx, &acy, &acz);
+			ACC_THRESHOLD = 0.1;
+			modes = climb;
+			break;
+
+		}//switch case bracket
+
+	}//while loop bracket
+
+	return 0;
+}

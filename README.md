@@ -8,3 +8,5 @@ The 3 main sensors to be used are the Accelerometer, Light and Temperature Senso
 
 This project applies system design approaches, such as using flowcharts, to design embedded applications, secondly, understand the interfaces between microcontrollers and peripherals, and lastly, develop C embedded programming controller-based applications.
 
+![Flowchart](https://user-images.githubusercontent.com/69966577/92536906-63ec2980-f26d-11ea-9301-51a4b665b5ae.JPG)
+![Flowchart(code)](https://user-images.githubusercontent.com/69966577/92536983-9433c800-f26d-11ea-8f3d-799a030ac436.JPG)
